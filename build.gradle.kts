@@ -2,7 +2,11 @@
 plugins {
     id("com.android.library") version "8.7.3"
     kotlin("android") version "2.1.0"
+    `maven-publish`
 }
+
+group = "com.metricsensei"
+version = "1.0.0"
 
 android {
     namespace = "com.metricsensei.analytics"
@@ -13,4 +17,16 @@ android {
         targetCompatibility = JavaVersion.VERSION_17
     }
     kotlinOptions { jvmTarget = "17" }
+    publishing { singleVariant("release") { withSourcesJar() } }
+}
+
+// For JitPack (and a later Maven Central release): com.metricsensei:analytics:<version>.
+publishing {
+    publications {
+        register<MavenPublication>("release") {
+            groupId = "com.metricsensei"
+            artifactId = "analytics"
+            afterEvaluate { from(components["release"]) }
+        }
+    }
 }

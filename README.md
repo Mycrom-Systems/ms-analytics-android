@@ -5,7 +5,7 @@ beyond the Android SDK. Android 6.0 (API 23)+.
 
 ## Install
 Until it's published to Maven Central, add it as a Gradle module or with JitPack:
-`implementation("com.github.Mycrom-Systems:ms-analytics-android:<tag>")`.
+`implementation("com.github.Mycrom-Systems:ms-analytics-android:<tag>")` (JitPack builds it with `./gradlew publishToMavenLocal`).
 
 ## Use
 1. In Metric Sensei, add the app under the client's Data sources > Websites & Apps (Android app, with its package
@@ -25,3 +25,6 @@ Privacy: no advertising ID, Android ID or personal data is read. The visitor ID 
 private preferences; `reset()` forgets it. The app needs the INTERNET permission (included in the library's manifest).
 
 MIT license.
+
+## Build
+JDK 17 and the Android SDK (platform 35): `./gradlew assembleRelease lint`.
