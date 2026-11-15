@@ -63,11 +63,11 @@ internal class Tracker(
         /** Batches sent in one go, so one flush can't keep the worker busy for long. */
         const val MAX_BATCHES_PER_FLUSH = 5
         /**
-         * Events older than this are dropped instead of sent: /v1/app clamps an event's offset ("o") to one hour,
-         * so an older event would be counted at the wrong time. A little under the hour leaves time for the send
-         * (the same 3,500 seconds as the iOS SDK).
+         * Events older than this are dropped instead of sent: /v1/app dates an app event at most a day back
+         * (ms-analytics events.APP_MAX_OFFSET_MS, 86,400,000 ms). 86,000 s leaves room for clock drift and the
+         * request's own time; the same number as the iOS SDK.
          */
-        const val MAX_AGE_MS = 3500 * 1000L
+        const val MAX_AGE_MS = 86_000 * 1000L
         /** Waits between failed sends: 10 s, doubling, at most 5 minutes. */
         const val FIRST_RETRY_MS = 10_000L
         const val MAX_RETRY_MS = 5 * 60 * 1000L

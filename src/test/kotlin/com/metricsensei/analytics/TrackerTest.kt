@@ -275,7 +275,7 @@ class TrackerTest {
     }
 
     @Test
-    fun `events older than 3,500 seconds are dropped, not sent with a wrong time`() {
+    fun `events older than 86,000 seconds are dropped, not sent with a wrong time`() {
         answer = null
         tracker.screen("Old")
         tracker.flush()
