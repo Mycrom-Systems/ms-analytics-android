@@ -10,8 +10,9 @@
 // preferences; call reset() when someone signs out if their next session shouldn't join the last.
 //
 // Events are sent every 10 seconds, when 20 are waiting, and when the app goes to the background. When a send
-// fails (offline, the service busy) they stay in memory, at most 1,000 and for up to 3,500 seconds, and are tried again
-// with a growing wait (10 seconds up to 5 minutes). Nothing is written to disk.
+// fails (offline, the service busy) they wait, at most 1,000 and for up to 3,500 seconds, and are tried again with a
+// growing wait (10 seconds up to 5 minutes). Waiting events are also kept in a file in the app's private no-backup
+// folder (never in backups, removed with the app), so they survive the app being closed.
 //
 // When the SDK itself fails (a batch the service refuses), it tells Metric Sensei so the problem can be fixed: at
 // most 3 short reports an app run to /v1/errors, holding the SDK's version, the step, the error and the Android
@@ -28,6 +29,7 @@ import android.content.SharedPreferences
 import android.os.Build
 import android.os.Bundle
 import org.json.JSONObject
+import java.io.File
 import java.net.HttpURLConnection
 import java.net.URL
 import java.util.Locale
@@ -52,10 +54,29 @@ object Analytics {
         override fun clear() { prefs?.edit()?.remove("visitor")?.apply() }
     }
 
+    /** The file holding waiting events; null until configure() has run. */
+    private var queueFile: File? = null
+
+    /** The waiting events in [queueFile], written to a temporary file first so a crash never leaves half a file. */
+    private val saved = object : QueueStore {
+        override fun load(): String? = queueFile?.takeIf { it.exists() }?.readText()
+        override fun save(text: String?) {
+            val file = queueFile ?: return
+            if (text == null) {
+                file.delete()
+                return
+            }
+            val tmp = File(file.parentFile, file.name + ".tmp")
+            tmp.writeText(text)
+            if (!tmp.renameTo(file)) tmp.delete()
+        }
+    }
+
     private val tracker = Tracker(
         clock = System::currentTimeMillis,
         send = ::post,
         visitors = visitors,
+        saved = saved,
         osVersion = Build.VERSION.RELEASE ?: "",
         language = { Locale.getDefault().toLanguageTag() },
     )
@@ -68,6 +89,7 @@ object Analytics {
         val app = context.applicationContext
         run {
             prefs = app.getSharedPreferences("metricsensei_analytics", Context.MODE_PRIVATE)
+            queueFile = File(app.noBackupFilesDir, "metricsensei_analytics_queue.json")
             tracker.configure(siteId, app.packageName, host)
             // Called again (a new site ID, a test host): stop the earlier timer, or each call would add one.
             timer?.cancel(false)

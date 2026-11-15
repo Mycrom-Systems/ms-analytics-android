@@ -25,7 +25,25 @@ class TrackerTest {
         override fun set(id: String) { saved = id }
         override fun clear() { saved = null }
     }
+    /** The fake saved-queue file: [file] is its text, null when there is none. */
+    private val disk = object : QueueStore {
+        var file: String? = null
+        var writes = 0
+        override fun load() = file
+        override fun save(text: String?) { file = text; writes += 1 }
+    }
     private lateinit var tracker: Tracker
+
+    /** A tracker sharing this test's clock, sender and stores, not configured yet (a new "app run"). */
+    private fun newTracker() =
+        Tracker(
+            clock = { now },
+            send = { url, body -> sent.add(Sent(url, JSONObject(body.toString()))); answer },
+            visitors = store,
+            saved = disk,
+            osVersion = "15",
+            language = { "en-US" },
+        )
 
     /** Batches sent to /v1/app (not failure reports). */
     private val batches get() = sent.filter { it.url.endsWith("/v1/app") }.map { it.body }
@@ -36,13 +54,7 @@ class TrackerTest {
     /** A tracker whose sender records each request and answers [answer]. */
     @Before
     fun setUp() {
-        tracker = Tracker(
-            clock = { now },
-            send = { url, body -> sent.add(Sent(url, JSONObject(body.toString()))); answer },
-            visitors = store,
-            osVersion = "15",
-            language = { "en-US" },
-        )
+        tracker = newTracker()
         tracker.configure("MS-APP00001", "com.acme.shop", "https://analytics.api.dev.metricsensei.com")
     }
 
@@ -133,7 +145,7 @@ class TrackerTest {
 
     @Test
     fun `events from before configure wait and then go with the saved visitor`() {
-        val early = Tracker({ now }, { url, body -> sent.add(Sent(url, body)); answer }, store, "15", { "en-US" })
+        val early = newTracker()
         store.saved = "c".repeat(32)
         early.screen("A")
         early.flush()
@@ -302,8 +314,64 @@ class TrackerTest {
     }
 
     @Test
+    fun `waiting events survive a restart and go out after configure`() {
+        answer = null
+        tracker.screen("A")
+        tracker.flush()
+        assertTrue(disk.file!!.contains("/A"))
+        assertFalse(disk.file!!.contains("\"p\":\"/A\",\"o\"")) // saved without an offset
+        val next = newTracker()
+        next.screen("B") // tracked before configure in the new run: goes after the saved one
+        answer = 202
+        now += 1000
+        next.configure("MS-APP00001", "com.acme.shop", "https://h")
+        next.flush()
+        val pages = batches.flatMap { b ->
+            val ev = b.getJSONArray("ev")
+            (0 until ev.length()).map { ev.getJSONObject(it).getString("p") }
+        }
+        assertEquals(listOf("/A", "/A", "/B"), pages) // the offline try, then the restored one, then the new one
+        assertEquals(2, batches.drop(1).map { it.getString("sid") }.distinct().size) // two sessions, two batches
+        assertNull(disk.file) // everything sent: the file is gone
+    }
+
+    @Test
+    fun `the file is written once per flush, not per event`() {
+        repeat(5) { tracker.track("e$it", emptyMap(), null, null) }
+        assertEquals(0, disk.writes)
+        answer = null
+        tracker.flush()
+        assertEquals(1, disk.writes)
+        tracker.flush() // nothing changed
+        assertEquals(1, disk.writes)
+    }
+
+    @Test
+    fun `a saved file that can't be read is dropped`() {
+        disk.file = "{not json"
+        val next = newTracker()
+        next.configure("MS-APP00001", "com.acme.shop", "https://h")
+        assertNull(disk.file)
+        assertEquals(0, next.queued)
+    }
+
+    @Test
+    fun `saved events too old to send are dropped after a restart`() {
+        answer = null
+        tracker.screen("A")
+        tracker.flush()
+        now += Tracker.MAX_AGE_MS + 1
+        answer = 202
+        val next = newTracker()
+        next.configure("MS-APP00001", "com.acme.shop", "https://h")
+        next.flush()
+        assertEquals(1, batches.size) // only the first offline try
+        assertNull(disk.file)
+    }
+
+    @Test
     fun `nothing is sent before configure`() {
-        val t = Tracker({ now }, { url, body -> sent.add(Sent(url, body)); answer }, store, "15", { "en-US" })
+        val t = newTracker()
         repeat(25) { t.track("e", emptyMap(), null, null) }
         t.flush()
         assertTrue(sent.isEmpty())

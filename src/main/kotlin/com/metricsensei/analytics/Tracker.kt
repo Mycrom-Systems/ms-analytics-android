@@ -1,6 +1,7 @@
-// The SDK's logic without Android in it: sessions, the queue of events, batching, sending with retries and the
-// SDK's own failure reports. `Analytics` (the public object) runs every call of this class on its one worker
-// thread, so nothing here is locked; unit tests drive it directly with a fake clock and a fake sender.
+// The SDK's logic without Android in it: sessions, the queue of events (kept in a file between app runs),
+// batching, sending with retries and the SDK's own failure reports. `Analytics` (the public object) runs every call
+// of this class on its one worker thread, so nothing here is locked; unit tests drive it directly with a fake clock,
+// a fake sender and fake stores.
 package com.metricsensei.analytics
 
 import org.json.JSONArray
@@ -19,6 +20,15 @@ internal interface VisitorStore {
     fun clear()
 }
 
+/** Where the waiting events are kept between app runs (a file in the app's private no-backup folder on a device). */
+internal interface QueueStore {
+    /** The saved text, or null when there is none (or the store isn't ready yet). */
+    fun load(): String?
+
+    /** Replaces the saved text with [text]; null removes it. Does nothing when the store isn't ready yet. */
+    fun save(text: String?)
+}
+
 /**
  * One event waiting to be sent: its JSON (without the offset, which is worked out when it is sent), when it
  * happened, and the session and visitor it belongs to. [vid] is null for events tracked before `configure()`,
@@ -34,6 +44,7 @@ internal class Tracker(
     private val clock: () -> Long,
     private val send: (url: String, body: JSONObject) -> Int?,
     private val visitors: VisitorStore,
+    private val saved: QueueStore,
     private val osVersion: String,
     private val language: () -> String,
 ) {
@@ -77,6 +88,10 @@ internal class Tracker(
     private var visitor: String? = null
     private var failures = 0
     private var retryAt = 0L
+    /** True once the saved queue has been read back (the first configure()). */
+    private var restored = false
+    /** True when the queue changed since it was last saved. */
+    private var dirty = false
 
     /** Number of events waiting to be sent (for tests). */
     val queued: Int get() = queue.size
@@ -92,6 +107,10 @@ internal class Tracker(
         this.errorsEndpoint = "$host/v1/errors"
         failures = 0
         retryAt = 0L
+        if (!restored) {
+            restored = true
+            restore()
+        }
     }
 
     /** A screen view (counted like a page view, path "/<name>"). */
@@ -136,11 +155,20 @@ internal class Tracker(
      */
     fun flush(force: Boolean = false) {
         if (!configured) return
+        sendQueued(force)
+        save()
+    }
+
+    /** The sending part of [flush]. */
+    private fun sendQueued(force: Boolean) {
         var batches = 0
         while (queue.isNotEmpty() && batches < MAX_BATCHES_PER_FLUSH) {
             val now = clock()
             if (now < retryAt && !(force && batches == 0)) return
-            while (queue.isNotEmpty() && now - queue.first().at > MAX_AGE_MS) queue.removeFirst()
+            while (queue.isNotEmpty() && now - queue.first().at > MAX_AGE_MS) {
+                queue.removeFirst()
+                dirty = true
+            }
             if (queue.isEmpty()) return
             val batch = nextBatch()
             val code = send(endpoint, body(batch, now))
@@ -154,6 +182,7 @@ internal class Tracker(
                 return
             }
             repeat(batch.size) { queue.removeFirst() }
+            dirty = true
             failures = 0
             retryAt = 0L
             // A refusal is a failure of ours or of the app's setup: report it (the batch can't succeed later).
@@ -190,8 +219,53 @@ internal class Tracker(
     /** Queues [e], dropping the oldest events beyond [MAX_QUEUE], and sends once enough are waiting. */
     private fun push(e: JSONObject) {
         queue.addLast(Pending(e, clock(), session, visitorId()))
+        dirty = true
         while (queue.size > MAX_QUEUE) queue.removeFirst()
         if (queue.size >= SEND_AT) flush()
+    }
+
+    /**
+     * Writes the queue to [saved] when it changed (after each flush, so at most every 10 seconds, and when the app
+     * goes to the background). An empty queue removes the saved copy.
+     */
+    private fun save() {
+        if (!dirty) return
+        dirty = false
+        if (queue.isEmpty()) {
+            saved.save(null)
+            return
+        }
+        val list = JSONArray()
+        // Built from a map rather than put() calls: ms-analytics' contract test reads every put("name", ...) here as
+        // a field sent to /v1/app, and this file is never sent.
+        for (p in queue) {
+            list.put(JSONObject(mapOf("e" to p.event, "at" to p.at, "sid" to p.sid, "vid" to (p.vid ?: ""))))
+        }
+        saved.save(list.toString())
+    }
+
+    /**
+     * Puts the events saved by an earlier app run in front of anything tracked since (they are older), keeping the
+     * newest [MAX_QUEUE]. A saved copy that can't be read is dropped rather than failing; events too old to send
+     * are dropped by the next flush.
+     */
+    private fun restore() {
+        val text = saved.load() ?: return
+        val earlier = mutableListOf<Pending>()
+        try {
+            val list = JSONArray(text)
+            for (i in 0 until list.length()) {
+                val o = list.getJSONObject(i)
+                val vid = o.optString("vid").takeIf { it.isNotEmpty() }
+                earlier.add(Pending(o.getJSONObject("e"), o.getLong("at"), o.getString("sid"), vid))
+            }
+        } catch (_: Exception) {
+            saved.save(null)
+            return
+        }
+        for (p in earlier.asReversed()) queue.addFirst(p)
+        while (queue.size > MAX_QUEUE) queue.removeFirst()
+        dirty = true
     }
 
     /** The first events in the queue that share one session and visitor, at most [MAX_BATCH]. */

@@ -26,9 +26,12 @@ out. `configure()` can be called again (another site ID or host); one send timer
 ## Delivery
 Events are sent every 10 seconds, at once when 20 are waiting, and when the app goes to the background (the SDK
 watches the app's activities itself; `Analytics.flush()` sends right away if you want to). When the phone is offline
-or the service is busy (HTTP 408, 429 or 5xx), the events stay queued in memory and the SDK tries again after 10
-seconds, doubling up to 5 minutes. At most 1,000 events wait (the oldest go first), and an event more than 3,500
-seconds old is dropped when sent, because the service dates events at most an hour back.
+or the service is busy (HTTP 408, 429 or 5xx), the events stay queued and the SDK tries again after 10 seconds,
+doubling up to 5 minutes. At most 1,000 events wait (the oldest go first), and an event more than 3,500 seconds old
+is dropped when sent, because the service dates events at most an hour back. Waiting events are also kept in
+`metricsensei_analytics_queue.json` in the app's private no-backup folder (`noBackupFilesDir`: never in backups,
+removed with the app), written at most every 10 seconds and when the app goes to the background, so they survive the
+app being closed. The file holds only what the SDK sends anyway, and is deleted once everything is sent.
 
 Privacy: no advertising ID, Android ID or personal data is read. The visitor ID is random and kept in the app's
 private preferences; `reset()` forgets it. The app needs the INTERNET permission (included in the library's manifest).
