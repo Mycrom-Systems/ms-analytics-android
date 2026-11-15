@@ -6,7 +6,7 @@ plugins {
 }
 
 group = "com.metricsensei"
-version = "1.1.0"
+version = "1.2.0"
 
 android {
     namespace = "com.metricsensei.analytics"
@@ -18,6 +18,13 @@ android {
     }
     kotlinOptions { jvmTarget = "17" }
     publishing { singleVariant("release") { withSourcesJar() } }
+}
+
+// Unit tests run on the JVM (./gradlew test). The Android SDK's org.json is only a stub there, so the tests get the
+// real one; neither is part of what apps install.
+dependencies {
+    testImplementation("junit:junit:4.13.2")
+    testImplementation("org.json:json:20240303")
 }
 
 // For JitPack (and a later Maven Central release): com.metricsensei:analytics:<version>.

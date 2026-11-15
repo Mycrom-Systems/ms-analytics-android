@@ -9,142 +9,146 @@
 // No advertising ID, Android ID or personal data is read. The visitor ID is random, kept in this app's private
 // preferences; call reset() when someone signs out if their next session shouldn't join the last.
 //
+// Events are sent every 10 seconds, when 20 are waiting, and when the app goes to the background. When a send
+// fails (offline, the service busy) they stay in memory, at most 1,000 and for up to 3,500 seconds, and are tried again
+// with a growing wait (10 seconds up to 5 minutes). Nothing is written to disk.
+//
 // When the SDK itself fails (a batch the service refuses), it tells Metric Sensei so the problem can be fixed: at
 // most 3 short reports an app run to /v1/errors, holding the SDK's version, the step, the error and the Android
 // version. Never the visitor ID, events or anything about the person. Being offline isn't a failure and is never
 // reported.
+//
+// The logic lives in Tracker.kt; this object only gives it a thread, a timer, storage and the network.
 package com.metricsensei.analytics
 
+import android.app.Activity
+import android.app.Application
 import android.content.Context
 import android.content.SharedPreferences
 import android.os.Build
-import org.json.JSONArray
+import android.os.Bundle
 import org.json.JSONObject
 import java.net.HttpURLConnection
 import java.net.URL
 import java.util.Locale
-import java.util.UUID
 import java.util.concurrent.Executors
+import java.util.concurrent.ScheduledFuture
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 
 object Analytics {
-    private const val SESSION_MS = 30 * 60 * 1000L
-    private val worker = Executors.newSingleThreadScheduledExecutor()
-    private val events = mutableListOf<JSONObject>()
+    /** Every call runs on this one thread, in order, so Tracker needs no locks and the app's thread never waits. */
+    private val worker = Executors.newSingleThreadScheduledExecutor { r ->
+        Thread(r, "metricsensei-analytics").apply { isDaemon = true }
+    }
     private var prefs: SharedPreferences? = null
-    private var siteId = ""
-    private var appId = ""
-    private var endpoint = "https://analytics.api.metricsensei.com/v1/app"
-    private var errorsEndpoint = "https://analytics.api.metricsensei.com/v1/errors"
-    private var reportsLeft = 3
-    private var session = ""
-    private var lastActivity = 0L
-    private var screenCount = 0
-    private var screenPath = ""
+    private var timer: ScheduledFuture<*>? = null
+    private val watchingLifecycle = AtomicBoolean(false)
 
-    /** Start sending. [host] is for testing environments (e.g. https://analytics.api.dev.metricsensei.com). */
+    /** The visitor ID in the app's private preferences; not ready (null) until configure() has run. */
+    private val visitors = object : VisitorStore {
+        override fun get(): String? = prefs?.getString("visitor", null)
+        override fun set(id: String) { prefs?.edit()?.putString("visitor", id)?.apply() }
+        override fun clear() { prefs?.edit()?.remove("visitor")?.apply() }
+    }
+
+    private val tracker = Tracker(
+        clock = System::currentTimeMillis,
+        send = ::post,
+        visitors = visitors,
+        osVersion = Build.VERSION.RELEASE ?: "",
+        language = { Locale.getDefault().toLanguageTag() },
+    )
+
+    /**
+     * Start sending. [host] is for testing environments (e.g. https://analytics.api.dev.metricsensei.com).
+     * Safe to call more than once: the latest site ID and host are used and one send timer runs.
+     */
     fun configure(context: Context, siteId: String, host: String = "https://analytics.api.metricsensei.com") {
-        worker.execute {
-            this.prefs = context.applicationContext.getSharedPreferences("metricsensei_analytics", Context.MODE_PRIVATE)
-            this.siteId = siteId
-            this.appId = context.packageName
-            this.endpoint = "$host/v1/app"
-            this.errorsEndpoint = "$host/v1/errors"
+        val app = context.applicationContext
+        run {
+            prefs = app.getSharedPreferences("metricsensei_analytics", Context.MODE_PRIVATE)
+            tracker.configure(siteId, app.packageName, host)
+            // Called again (a new site ID, a test host): stop the earlier timer, or each call would add one.
+            timer?.cancel(false)
+            timer = worker.scheduleWithFixedDelay({ safely { tracker.flush() } }, 10, 10, TimeUnit.SECONDS)
         }
-        worker.scheduleWithFixedDelay({ flushNow() }, 10, 10, TimeUnit.SECONDS)
+        watchLifecycle(app)
     }
 
     /** A screen view (counted like a page view, path "/<name>"). */
-    fun screen(name: String) = worker.execute {
-        touchSession()
-        screenCount += 1
-        screenPath = "/" + name.replace(' ', '-')
-        val e = JSONObject().put("t", "pv").put("p", screenPath).put("n", screenCount).put("at", System.currentTimeMillis())
-        if (screenCount == 2) e.put("nb", 1)
-        push(e)
-    }
+    fun screen(name: String) = run { tracker.screen(name) }
 
-    /** A named event, with optional properties and revenue. */
+    /** A named event, with optional properties (text, numbers, true/false) and revenue. */
     fun track(name: String, props: Map<String, Any> = emptyMap(), revenue: Double? = null, currency: String? = null) =
-        worker.execute {
-            touchSession()
-            val pr = JSONObject()
-            for ((k, v) in props) if (v is String || v is Number) pr.put(k, v)
-            revenue?.let { pr.put("revenue", it) }
-            currency?.let { pr.put("currency", it) }
-            push(JSONObject().put("t", "ev").put("nm", name).put("pr", pr).put("p", screenPath).put("at", System.currentTimeMillis()))
-        }
+        run { tracker.track(name, props, revenue, currency) }
 
     /** Forget the visitor ID (a new one is made on the next event). */
-    fun reset() = worker.execute { prefs?.edit()?.remove("visitor")?.apply(); session = "" }
+    fun reset() = run { tracker.reset() }
 
-    /** Send what is queued now (e.g. in onStop). */
-    fun flush() = worker.execute { flushNow() }
+    /** Send what is queued now. Also done by itself when the app goes to the background. */
+    fun flush() = run { tracker.flush(force = true) }
 
-    private fun visitorId(): String {
-        val p = prefs ?: return "unknown"
-        p.getString("visitor", null)?.let { return it }
-        val v = UUID.randomUUID().toString().replace("-", "")
-        p.edit().putString("visitor", v).apply()
-        return v
+    /** Runs [block] on the worker thread. */
+    private fun run(block: () -> Unit) {
+        worker.execute { safely(block) }
     }
 
-    private fun touchSession() {
-        val now = System.currentTimeMillis()
-        if (session.isEmpty() || now - lastActivity > SESSION_MS) {
-            session = UUID.randomUUID().toString().replace("-", "")
-            screenCount = 0
+    /**
+     * Runs [block], swallowing anything it throws: analytics must never crash the app, and an exception would
+     * also stop the repeating send timer for good.
+     */
+    private fun safely(block: () -> Unit) {
+        try {
+            block()
+        } catch (_: Throwable) {
         }
-        lastActivity = now
     }
 
-    private fun push(e: JSONObject) {
-        events.add(e)
-        if (events.size >= 20) flushNow()
-    }
+    /**
+     * Flushes when the app's last visible activity stops (the app went to the background), using the Android
+     * SDK's own activity callbacks, so no extra library is needed. Registered once, whatever configure() does.
+     */
+    private fun watchLifecycle(context: Context) {
+        val app = context as? Application ?: return
+        if (!watchingLifecycle.compareAndSet(false, true)) return
+        app.registerActivityLifecycleCallbacks(object : Application.ActivityLifecycleCallbacks {
+            // Only touched on the main thread, where Android calls these.
+            private var started = 0
 
-    private fun flushNow() {
-        if (events.isEmpty() || siteId.isEmpty()) return
-        val batch = events.take(50)
-        events.subList(0, batch.size).clear()
-        val now = System.currentTimeMillis()
-        val ev = JSONArray()
-        for (e in batch) {
-            val at = e.optLong("at", now)
-            e.remove("at")
-            ev.put(e.put("o", (now - at).coerceAtLeast(0)))
-        }
-        val body = JSONObject().put("v", 1).put("site", siteId).put("app", appId).put("sid", session)
-            .put("vid", visitorId()).put("ev", ev).put("os", "Android").put("lang", Locale.getDefault().toLanguageTag())
-            .put("sv", "1.1.0")
-        val code = post(endpoint, body) ?: return // offline: these events are dropped (a later version may retry)
-        // A refusal (other than "slow down") is a failure of ours or of the app's setup: report it.
-        if (code >= 400 && code != 429) report("flush", "http_$code", "The service refused a batch with HTTP $code")
+            override fun onActivityStarted(activity: Activity) {
+                started += 1
+            }
+
+            override fun onActivityStopped(activity: Activity) {
+                started = (started - 1).coerceAtLeast(0)
+                // A rotation stops and restarts the activity: that isn't the app leaving the screen.
+                if (started == 0 && !activity.isChangingConfigurations) flush()
+            }
+
+            override fun onActivityCreated(activity: Activity, savedInstanceState: Bundle?) {}
+            override fun onActivityResumed(activity: Activity) {}
+            override fun onActivityPaused(activity: Activity) {}
+            override fun onActivitySaveInstanceState(activity: Activity, outState: Bundle) {}
+            override fun onActivityDestroyed(activity: Activity) {}
+        })
     }
 
     /** POSTs [body] as JSON to [url] and returns the HTTP status, or null when there was no answer (offline). */
     private fun post(url: String, body: JSONObject): Int? = try {
         val conn = URL(url).openConnection() as HttpURLConnection
-        conn.requestMethod = "POST"
-        conn.doOutput = true
-        conn.connectTimeout = 10_000
-        conn.readTimeout = 10_000
-        conn.setRequestProperty("Content-Type", "application/json")
-        conn.outputStream.use { it.write(body.toString().toByteArray()) }
-        val status = conn.responseCode
-        conn.disconnect()
-        status
+        try {
+            conn.requestMethod = "POST"
+            conn.doOutput = true
+            conn.connectTimeout = 10_000
+            conn.readTimeout = 10_000
+            conn.setRequestProperty("Content-Type", "application/json")
+            conn.outputStream.use { it.write(body.toString().toByteArray()) }
+            conn.responseCode
+        } finally {
+            conn.disconnect()
+        }
     } catch (_: Exception) {
         null
-    }
-
-    /** Reports a failure of this SDK itself to the platform's failures dataset (POST /v1/errors, read by
-     *  ms_core.failures.client_report): at most 3 an app run, nothing about the person or their events. */
-    private fun report(step: String, name: String, message: String) {
-        if (reportsLeft <= 0) return
-        reportsLeft -= 1
-        val body = JSONObject().put("v", 1).put("src", "android").put("sv", "1.1.0").put("where", step)
-            .put("name", name).put("msg", message).put("site", siteId).put("os", "Android ${Build.VERSION.RELEASE}")
-        post(errorsEndpoint, body)
     }
 }

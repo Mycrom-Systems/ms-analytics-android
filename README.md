@@ -18,8 +18,17 @@ import com.metricsensei.analytics.Analytics
 Analytics.configure(this, siteId = "MS-XXXXXXXX")
 Analytics.screen("Home")
 Analytics.track("Purchase", mapOf("plan" to "pro"), revenue = 49.9, currency = "USD")
-Analytics.flush() // e.g. in onStop
 ```
+
+Property values can be text, numbers or true/false; anything else (and numbers JSON can't hold, like NaN) is left
+out. `configure()` can be called again (another site ID or host); one send timer runs.
+
+## Delivery
+Events are sent every 10 seconds, at once when 20 are waiting, and when the app goes to the background (the SDK
+watches the app's activities itself; `Analytics.flush()` sends right away if you want to). When the phone is offline
+or the service is busy (HTTP 408, 429 or 5xx), the events stay queued in memory and the SDK tries again after 10
+seconds, doubling up to 5 minutes. At most 1,000 events wait (the oldest go first), and an event more than 3,500
+seconds old is dropped when sent, because the service dates events at most an hour back.
 
 Privacy: no advertising ID, Android ID or personal data is read. The visitor ID is random and kept in the app's
 private preferences; `reset()` forgets it. The app needs the INTERNET permission (included in the library's manifest).
@@ -31,4 +40,12 @@ ID, events or anything about the person; being offline is never reported.
 MIT license.
 
 ## Build
-JDK 17 and the Android SDK (platform 35): `./gradlew assembleRelease lint`.
+JDK 17 and the Android SDK (platform 35): `./gradlew assembleRelease lint test`. The logic is in `Tracker.kt`
+(plain Kotlin, no Android classes), so the unit tests in `src/test` run on the JVM.
+
+## Releasing
+The version is written in three places that must agree: `version` in `build.gradle.kts` and both
+`put("sv", ...)` calls in `Tracker.kt` (ms-core `scripts/check-packages.py` fails otherwise). Raise it with any
+change. After the next prod release, ms-core `scripts/publish-packages.py` tags `v<version>` and JitPack builds
+that tag. Every field the SDK sends must be one ms-analytics' `/v1/app` or `/v1/errors` reads
+(ms-analytics `tests/test_app_sdk_contract.py` reads this repo's source).
