@@ -156,8 +156,11 @@ object Analytics {
         })
     }
 
-    /** POSTs [body] as JSON to [url] and returns the HTTP status, or null when there was no answer (offline). */
-    private fun post(url: String, body: JSONObject): Int? = try {
+    /**
+     * POSTs [body] as JSON to [url] and returns the service's status and Retry-After (seconds, turned into
+     * milliseconds), or null when there was no answer (offline).
+     */
+    private fun post(url: String, body: JSONObject): Answer? = try {
         val conn = URL(url).openConnection() as HttpURLConnection
         try {
             conn.requestMethod = "POST"
@@ -166,7 +169,8 @@ object Analytics {
             conn.readTimeout = 10_000
             conn.setRequestProperty("Content-Type", "application/json")
             conn.outputStream.use { it.write(body.toString().toByteArray()) }
-            conn.responseCode
+            val code = conn.responseCode
+            Answer(code, conn.getHeaderField("Retry-After")?.trim()?.toLongOrNull()?.times(1000))
         } finally {
             conn.disconnect()
         }

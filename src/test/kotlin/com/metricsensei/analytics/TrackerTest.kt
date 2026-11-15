@@ -19,6 +19,8 @@ class TrackerTest {
     private val sent = mutableListOf<Sent>()
     /** The status the fake service answers with; null means offline. */
     private var answer: Int? = 202
+    /** The Retry-After the fake service gives with its answer, in milliseconds. */
+    private var retryAfter: Long? = null
     private val store = object : VisitorStore {
         var saved: String? = null
         override fun get() = saved
@@ -38,7 +40,10 @@ class TrackerTest {
     private fun newTracker() =
         Tracker(
             clock = { now },
-            send = { url, body -> sent.add(Sent(url, JSONObject(body.toString()))); answer },
+            send = { url, body ->
+                sent.add(Sent(url, JSONObject(body.toString())))
+                answer?.let { Answer(it, retryAfter) }
+            },
             visitors = store,
             saved = disk,
             osVersion = "15",
@@ -70,7 +75,7 @@ class TrackerTest {
         assertEquals("com.acme.shop", body.getString("app"))
         assertEquals("Android", body.getString("os"))
         assertEquals("en-US", body.getString("lang"))
-        assertEquals("1.2.0", body.getString("sv"))
+        assertEquals("1.3.0", body.getString("sv"))
         assertTrue(body.getString("sid").matches(Regex("^[0-9a-f]{32}$")))
         assertTrue(body.getString("vid").matches(Regex("^[0-9a-f]{32}$")))
         val ev = body.getJSONArray("ev")
@@ -240,7 +245,7 @@ class TrackerTest {
         assertEquals(0, tracker.queued)
         val r = reports.single()
         assertEquals("android", r.getString("src"))
-        assertEquals("1.2.0", r.getString("sv"))
+        assertEquals("1.3.0", r.getString("sv"))
         assertEquals("flush", r.getString("where"))
         assertEquals("http_404", r.getString("name"))
         assertEquals("MS-APP00001", r.getString("site"))
@@ -381,6 +386,95 @@ class TrackerTest {
         val vid = batches.single().getString("vid")
         assertNotEquals("d".repeat(32), vid)
         assertEquals(store.saved, vid)
+    }
+
+    @Test
+    fun `every event has its own ID and every batch one ID`() {
+        tracker.screen("A")
+        tracker.track("e", emptyMap(), null, null)
+        tracker.flush()
+        val body = batches.single()
+        assertTrue(body.getString("b").matches(Regex("^[0-9a-f]{32}$")))
+        val ids = (0 until 2).map { body.getJSONArray("ev").getJSONObject(it).getString("id") }
+        assertTrue(ids.all { it.matches(Regex("^[0-9a-f]{16}$")) })
+        assertNotEquals(ids[0], ids[1])
+        tracker.screen("B")
+        tracker.flush()
+        assertNotEquals(batches[0].getString("b"), batches[1].getString("b"))
+    }
+
+    @Test
+    fun `a retried batch keeps its ID and its members, even with new events waiting`() {
+        answer = null
+        tracker.screen("A")
+        tracker.screen("B")
+        tracker.flush()
+        tracker.screen("C") // same session: would join the batch if it weren't fixed
+        answer = 202
+        tracker.flush(force = true)
+        assertEquals(3, batches.size)
+        assertEquals(batches[0].getString("b"), batches[1].getString("b"))
+        assertEquals(batches[0].getJSONArray("ev").getJSONObject(0).getString("id"),
+            batches[1].getJSONArray("ev").getJSONObject(0).getString("id"))
+        assertEquals(2, batches[1].getJSONArray("ev").length())
+        assertEquals("/C", batches[2].getJSONArray("ev").getJSONObject(0).getString("p"))
+        assertNotEquals(batches[1].getString("b"), batches[2].getString("b"))
+    }
+
+    @Test
+    fun `a batch keeps its ID across a restart`() {
+        answer = null
+        tracker.screen("A")
+        tracker.flush()
+        val first = batches.single()
+        val next = newTracker()
+        answer = 202
+        next.configure("MS-APP00001", "com.acme.shop", "https://h")
+        next.flush()
+        assertEquals(first.getString("b"), batches.last().getString("b"))
+        assertEquals(first.getJSONArray("ev").getJSONObject(0).getString("id"),
+            batches.last().getJSONArray("ev").getJSONObject(0).getString("id"))
+    }
+
+    @Test
+    fun `a duplicate answer finishes the batch`() {
+        tracker.screen("A")
+        answer = 202 // the service says {"accepted":0,"duplicate":true}: it already counted this batch
+        tracker.flush()
+        assertEquals(0, tracker.queued)
+        assertTrue(reports.isEmpty())
+    }
+
+    @Test
+    fun `409 in progress is retried after the service's Retry-After and never reported`() {
+        tracker.screen("A")
+        answer = 409
+        retryAfter = 30_000
+        tracker.flush()
+        assertEquals(1, tracker.queued)
+        now += Tracker.FIRST_RETRY_MS // our own wait is over, the service's isn't
+        tracker.flush()
+        assertEquals(1, sent.size)
+        now += 20_000
+        answer = 202
+        retryAfter = null
+        tracker.flush()
+        assertEquals(2, sent.size)
+        assertEquals(batches[0].getString("b"), batches[1].getString("b"))
+        assertEquals(0, tracker.queued)
+        assertTrue(reports.isEmpty())
+    }
+
+    @Test
+    fun `a Retry-After longer than an hour is capped`() {
+        tracker.screen("A")
+        answer = 503
+        retryAfter = 24 * 3600 * 1000L
+        tracker.flush()
+        answer = 202
+        now += Tracker.MAX_RETRY_AFTER_MS
+        tracker.flush()
+        assertEquals(0, tracker.queued)
     }
 
     @Test

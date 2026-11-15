@@ -34,15 +34,25 @@ internal interface QueueStore {
  * happened, and the session and visitor it belongs to. [vid] is null for events tracked before `configure()`,
  * when the saved visitor ID can't be read yet; those take the visitor ID once it can.
  */
-internal class Pending(val event: JSONObject, val at: Long, val sid: String, val vid: String?)
+internal class Pending(val event: JSONObject, val at: Long, val sid: String, val vid: String?) {
+    /**
+     * The batch this event was first tried in ("b"), or null before its first try. A batch keeps its ID and its
+     * members on every retry, also after a restart, so /v1/app can recognise a batch it already took (an answer
+     * lost on the way back) and count it once.
+     */
+    var batch: String? = null
+}
+
+/** What /v1/app answered: the HTTP status and, when it said when to try again, that wait in milliseconds. */
+internal class Answer(val code: Int, val retryAfterMs: Long? = null)
 
 /**
- * Sessions, queue and sending. [send] POSTs a JSON body and returns the HTTP status, or null when there was no
- * answer (offline). [clock] is milliseconds since the epoch.
+ * Sessions, queue and sending. [send] POSTs a JSON body and returns the service's [Answer], or null when there was
+ * no answer (offline). [clock] is milliseconds since the epoch.
  */
 internal class Tracker(
     private val clock: () -> Long,
-    private val send: (url: String, body: JSONObject) -> Int?,
+    private val send: (url: String, body: JSONObject) -> Answer?,
     private val visitors: VisitorStore,
     private val saved: QueueStore,
     private val osVersion: String,
@@ -71,6 +81,8 @@ internal class Tracker(
         /** Waits between failed sends: 10 s, doubling, at most 5 minutes. */
         const val FIRST_RETRY_MS = 10_000L
         const val MAX_RETRY_MS = 5 * 60 * 1000L
+        /** The longest Retry-After the SDK honours, so a wrong header can't stop sending for long. */
+        const val MAX_RETRY_AFTER_MS = 60 * 60 * 1000L
         /** The SDK's own failure reports per app run. */
         const val MAX_REPORTS = 3
     }
@@ -160,8 +172,10 @@ internal class Tracker(
     /**
      * Sends what is queued, in batches of one session and visitor each. After a failed send the timer's flushes
      * wait out the retry delay; a [force]d one (the app's own flush() or going to the background) tries at once.
-     * A batch that couldn't be delivered (offline, 408, 429, 5xx) stays queued for the next try; one the service
-     * refused for good (another 4xx) is dropped and reported, as is the first 5xx of a run of failures.
+     * A batch that couldn't be delivered (offline, 408, 409 "still in progress", 429, 5xx) stays queued with its
+     * batch ID for the next try, no sooner than the service's Retry-After; one the service refused for good (another
+     * 4xx) is dropped and reported, as is the first 5xx of a run of failures. Any 2xx, including "duplicate" (the
+     * service already had this batch), finishes the batch.
      */
     fun flush(force: Boolean = false) {
         if (!configured) return
@@ -181,10 +195,12 @@ internal class Tracker(
             }
             if (queue.isEmpty()) return
             val batch = nextBatch()
-            val code = send(endpoint, body(batch, now))
-            if (code == null || code == 408 || code == 429 || code >= 500) {
+            val answer = send(endpoint, body(batch, now))
+            val code = answer?.code
+            if (code == null || code == 408 || code == 409 || code == 429 || code >= 500) {
                 failures += 1
-                retryAt = now + retryDelay()
+                val asked = (answer?.retryAfterMs ?: 0L).coerceIn(0L, MAX_RETRY_AFTER_MS)
+                retryAt = now + maxOf(retryDelay(), asked)
                 // Offline and "slow down" are normal; a server error is ours, so the first one is reported.
                 if (code != null && code >= 500 && failures == 1) {
                     report("flush", "http_$code", "The service failed a batch with HTTP $code")
@@ -228,6 +244,8 @@ internal class Tracker(
 
     /** Queues [e], dropping the oldest events beyond [MAX_QUEUE], and sends once enough are waiting. */
     private fun push(e: JSONObject) {
+        // Each event's own ID ("id"), so the stored data can tell a repeat from a second event (/v1/app keeps it).
+        e.put("id", randomHex(16))
         queue.addLast(Pending(e, clock(), session, visitorId()))
         dirty = true
         while (queue.size > MAX_QUEUE) queue.removeFirst()
@@ -249,7 +267,8 @@ internal class Tracker(
         // Built from a map rather than put() calls: ms-analytics' contract test reads every put("name", ...) here as
         // a field sent to /v1/app, and this file is never sent.
         for (p in queue) {
-            list.put(JSONObject(mapOf("e" to p.event, "at" to p.at, "sid" to p.sid, "vid" to (p.vid ?: ""))))
+            val item = mapOf("e" to p.event, "at" to p.at, "sid" to p.sid, "vid" to (p.vid ?: ""))
+            list.put(JSONObject(item + ("b" to (p.batch ?: ""))))
         }
         saved.save(list.toString())
     }
@@ -267,7 +286,9 @@ internal class Tracker(
             for (i in 0 until list.length()) {
                 val o = list.getJSONObject(i)
                 val vid = o.optString("vid").takeIf { it.isNotEmpty() }
-                earlier.add(Pending(o.getJSONObject("e"), o.getLong("at"), o.getString("sid"), vid))
+                val p = Pending(o.getJSONObject("e"), o.getLong("at"), o.getString("sid"), vid)
+                p.batch = o.optString("b").takeIf { it.isNotEmpty() }
+                earlier.add(p)
             }
         } catch (_: Exception) {
             saved.save(null)
@@ -278,16 +299,31 @@ internal class Tracker(
         dirty = true
     }
 
-    /** The first events in the queue that share one session and visitor, at most [MAX_BATCH]. */
+    /**
+     * The next batch. A batch tried before is sent again exactly as it was (its ID and the members still queued);
+     * otherwise the first events that share one session and visitor, at most [MAX_BATCH], become a new batch with a
+     * new ID, saved with the queue.
+     */
     private fun nextBatch(): List<Pending> {
         val first = queue.first()
+        first.batch?.let { id -> return queue.takeWhile { it.batch == id }.take(MAX_BATCH) }
         val vid = first.vid ?: visitorId()
         val batch = mutableListOf<Pending>()
         for (p in queue) {
-            if (batch.size >= MAX_BATCH || p.sid != first.sid || (p.vid ?: visitorId()) != vid) break
+            if (batch.size >= MAX_BATCH || p.batch != null || p.sid != first.sid || (p.vid ?: visitorId()) != vid) break
             batch.add(p)
         }
+        val id = randomHex(32)
+        for (p in batch) p.batch = id
+        dirty = true
         return batch
+    }
+
+    /** [n] random hexadecimal characters. */
+    private fun randomHex(n: Int): String {
+        val out = StringBuilder()
+        while (out.length < n) out.append(UUID.randomUUID().toString().replace("-", ""))
+        return out.substring(0, n)
     }
 
     /** The /v1/app body for [batch]: each event gets its age in milliseconds as "o". */
@@ -295,9 +331,9 @@ internal class Tracker(
         val ev = JSONArray()
         for (p in batch) ev.put(JSONObject(p.event.toString()).put("o", (now - p.at).coerceAtLeast(0)))
         val first = batch.first()
-        return JSONObject().put("v", 1).put("site", siteId).put("app", appId).put("sid", first.sid)
-            .put("vid", first.vid ?: visitorId()).put("ev", ev).put("os", "Android").put("lang", language())
-            .put("sv", "1.2.0")
+        return JSONObject().put("v", 1).put("site", siteId).put("app", appId).put("b", first.batch)
+            .put("sid", first.sid).put("vid", first.vid ?: visitorId()).put("ev", ev).put("os", "Android")
+            .put("lang", language()).put("sv", "1.3.0")
     }
 
     /** Reports a failure of this SDK itself to the platform's failures dataset (POST /v1/errors, read by
@@ -305,7 +341,7 @@ internal class Tracker(
     private fun report(step: String, name: String, message: String) {
         if (reportsLeft <= 0) return
         reportsLeft -= 1
-        val body = JSONObject().put("v", 1).put("src", "android").put("sv", "1.2.0").put("where", step)
+        val body = JSONObject().put("v", 1).put("src", "android").put("sv", "1.3.0").put("where", step)
             .put("name", name).put("msg", message).put("site", siteId).put("os", "Android $osVersion")
         send(errorsEndpoint, body)
     }

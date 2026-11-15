@@ -33,6 +33,11 @@ are also kept in `metricsensei_analytics_queue.json` in the app's private no-bac
 in backups, removed with the app), written at most every 10 seconds and when the app goes to the background, so they
 survive the app being closed. The file holds only what the SDK sends anyway, and is deleted once everything is sent.
 
+Each event carries a random ID (`id`) and each batch one (`b`). A batch keeps its ID and its events on every retry,
+also after a restart, so when the service took a batch but its answer was lost, the retry is recognised and
+counted once (the service answers "duplicate"). A 409 ("that batch is still being processed") and any
+`Retry-After` the service sends make the SDK wait at least that long (at most an hour) before trying again.
+
 Privacy: no advertising ID, Android ID or personal data is read. The visitor ID is random and kept in the app's
 private preferences; `reset()` forgets it. The app needs the INTERNET permission (included in the library's manifest).
 
