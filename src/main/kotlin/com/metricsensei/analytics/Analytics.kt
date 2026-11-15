@@ -11,8 +11,8 @@
 //
 // Events are sent every 10 seconds, when 20 are waiting, and when the app goes to the background. When a send
 // fails (offline, the service busy) they wait, at most 1,000 and for up to 86,000 seconds (about a day), and are
-// tried again with a growing wait (10 seconds up to 5 minutes). Waiting events are also kept in a file in the app's private no-backup
-// folder (never in backups, removed with the app), so they survive the app being closed.
+// tried again with a growing wait (10 seconds up to 5 minutes). Waiting events are also kept in a file in the app's
+// private no-backup folder (never in backups, removed with the app), so they survive the app being closed.
 //
 // When the SDK itself fails (a batch the service refuses), it tells Metric Sensei so the problem can be fixed: at
 // most 3 short reports an app run to /v1/errors, holding the SDK's version, the step, the error and the Android

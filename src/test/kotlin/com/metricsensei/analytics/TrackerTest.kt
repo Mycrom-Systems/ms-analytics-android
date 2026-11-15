@@ -370,6 +370,20 @@ class TrackerTest {
     }
 
     @Test
+    fun `reset before configure still forgets the saved visitor`() {
+        store.saved = "d".repeat(32)
+        val next = newTracker()
+        next.reset() // the store isn't ready yet on a device: prefs are opened by configure()
+        store.saved = "d".repeat(32) // stands in for the copy a real store couldn't clear yet
+        next.configure("MS-APP00001", "com.acme.shop", "https://h")
+        next.screen("A")
+        next.flush()
+        val vid = batches.single().getString("vid")
+        assertNotEquals("d".repeat(32), vid)
+        assertEquals(store.saved, vid)
+    }
+
+    @Test
     fun `nothing is sent before configure`() {
         val t = newTracker()
         repeat(25) { t.track("e", emptyMap(), null, null) }

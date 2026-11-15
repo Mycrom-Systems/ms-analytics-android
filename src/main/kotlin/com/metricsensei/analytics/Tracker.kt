@@ -92,6 +92,8 @@ internal class Tracker(
     private var restored = false
     /** True when the queue changed since it was last saved. */
     private var dirty = false
+    /** True when reset() was called before configure(), when the saved visitor ID couldn't be cleared yet. */
+    private var clearOnConfigure = false
 
     /** Number of events waiting to be sent (for tests). */
     val queued: Int get() = queue.size
@@ -107,6 +109,10 @@ internal class Tracker(
         this.errorsEndpoint = "$host/v1/errors"
         failures = 0
         retryAt = 0L
+        if (clearOnConfigure) {
+            clearOnConfigure = false
+            visitors.clear()
+        }
         if (!restored) {
             restored = true
             restore()
@@ -140,8 +146,12 @@ internal class Tracker(
         push(JSONObject().put("t", "ev").put("nm", name).put("pr", pr).put("p", screenPath))
     }
 
-    /** Forgets the visitor ID and ends the session. Events already queued keep the visitor they were tracked as. */
+    /**
+     * Forgets the visitor ID and ends the session. Events already queued keep the visitor they were tracked as.
+     * Before [configure] the saved ID can't be reached yet, so it is cleared as soon as configure() runs.
+     */
     fun reset() {
+        if (!configured) clearOnConfigure = true
         visitors.clear()
         visitor = null
         session = ""
