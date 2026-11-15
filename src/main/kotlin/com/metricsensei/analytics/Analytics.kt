@@ -8,10 +8,16 @@
 //
 // No advertising ID, Android ID or personal data is read. The visitor ID is random, kept in this app's private
 // preferences; call reset() when someone signs out if their next session shouldn't join the last.
+//
+// When the SDK itself fails (a batch the service refuses), it tells Metric Sensei so the problem can be fixed: at
+// most 3 short reports an app run to /v1/errors, holding the SDK's version, the step, the error and the Android
+// version. Never the visitor ID, events or anything about the person. Being offline isn't a failure and is never
+// reported.
 package com.metricsensei.analytics
 
 import android.content.Context
 import android.content.SharedPreferences
+import android.os.Build
 import org.json.JSONArray
 import org.json.JSONObject
 import java.net.HttpURLConnection
@@ -29,6 +35,8 @@ object Analytics {
     private var siteId = ""
     private var appId = ""
     private var endpoint = "https://analytics.api.metricsensei.com/v1/app"
+    private var errorsEndpoint = "https://analytics.api.metricsensei.com/v1/errors"
+    private var reportsLeft = 3
     private var session = ""
     private var lastActivity = 0L
     private var screenCount = 0
@@ -41,6 +49,7 @@ object Analytics {
             this.siteId = siteId
             this.appId = context.packageName
             this.endpoint = "$host/v1/app"
+            this.errorsEndpoint = "$host/v1/errors"
         }
         worker.scheduleWithFixedDelay({ flushNow() }, 10, 10, TimeUnit.SECONDS)
     }
@@ -107,19 +116,35 @@ object Analytics {
         }
         val body = JSONObject().put("v", 1).put("site", siteId).put("app", appId).put("sid", session)
             .put("vid", visitorId()).put("ev", ev).put("os", "Android").put("lang", Locale.getDefault().toLanguageTag())
-            .put("sv", "1.0.0")
-        try {
-            val conn = URL(endpoint).openConnection() as HttpURLConnection
-            conn.requestMethod = "POST"
-            conn.doOutput = true
-            conn.connectTimeout = 10_000
-            conn.readTimeout = 10_000
-            conn.setRequestProperty("Content-Type", "application/json")
-            conn.outputStream.use { it.write(body.toString().toByteArray()) }
-            conn.responseCode
-            conn.disconnect()
-        } catch (_: Exception) {
-            // offline: these events are dropped (kept simple; a later version may store and retry)
-        }
+            .put("sv", "1.1.0")
+        val code = post(endpoint, body) ?: return // offline: these events are dropped (a later version may retry)
+        // A refusal (other than "slow down") is a failure of ours or of the app's setup: report it.
+        if (code >= 400 && code != 429) report("flush", "http_$code", "The service refused a batch with HTTP $code")
+    }
+
+    /** POSTs [body] as JSON to [url] and returns the HTTP status, or null when there was no answer (offline). */
+    private fun post(url: String, body: JSONObject): Int? = try {
+        val conn = URL(url).openConnection() as HttpURLConnection
+        conn.requestMethod = "POST"
+        conn.doOutput = true
+        conn.connectTimeout = 10_000
+        conn.readTimeout = 10_000
+        conn.setRequestProperty("Content-Type", "application/json")
+        conn.outputStream.use { it.write(body.toString().toByteArray()) }
+        val status = conn.responseCode
+        conn.disconnect()
+        status
+    } catch (_: Exception) {
+        null
+    }
+
+    /** Reports a failure of this SDK itself to the platform's failures dataset (POST /v1/errors, read by
+     *  ms_core.failures.client_report): at most 3 an app run, nothing about the person or their events. */
+    private fun report(step: String, name: String, message: String) {
+        if (reportsLeft <= 0) return
+        reportsLeft -= 1
+        val body = JSONObject().put("v", 1).put("src", "android").put("sv", "1.1.0").put("where", step)
+            .put("name", name).put("msg", message).put("site", siteId).put("os", "Android ${Build.VERSION.RELEASE}")
+        post(errorsEndpoint, body)
     }
 }
