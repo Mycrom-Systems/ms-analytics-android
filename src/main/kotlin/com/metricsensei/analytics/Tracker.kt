@@ -302,7 +302,7 @@ internal class Tracker(
     /**
      * The next batch. A batch tried before is sent again exactly as it was (its ID and the members still queued);
      * otherwise the first events that share one session and visitor, at most [MAX_BATCH], become a new batch with a
-     * new ID, saved with the queue.
+     * new ID, and the queue is saved at once so the ID is on disk before the batch is sent.
      */
     private fun nextBatch(): List<Pending> {
         val first = queue.first()
@@ -316,6 +316,9 @@ internal class Tracker(
         val id = randomHex(32)
         for (p in batch) p.batch = id
         dirty = true
+        // Saved before the first send, not after: if the app is killed while that request is in flight (the case
+        // batch IDs exist for), the next run must resend these events under this ID, or they'd be counted twice.
+        save()
         return batch
     }
 

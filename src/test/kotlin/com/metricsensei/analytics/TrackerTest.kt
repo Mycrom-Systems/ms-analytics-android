@@ -422,6 +422,39 @@ class TrackerTest {
     }
 
     @Test
+    fun `a new batch ID is saved before the send, so a kill mid-send resends it under the same ID`() {
+        // The app is killed while the first request is in flight: the queue file is whatever was saved by then.
+        var fileAtSend: String? = null
+        val dying = Tracker(
+            clock = { now },
+            send = { url, body ->
+                if (url.endsWith("/v1/app") && fileAtSend == null) fileAtSend = disk.file
+                sent.add(Sent(url, JSONObject(body.toString())))
+                null
+            },
+            visitors = store,
+            saved = disk,
+            osVersion = "15",
+            language = { "en-US" },
+        )
+        dying.configure("MS-APP00001", "com.acme.shop", "https://analytics.api.dev.metricsensei.com")
+        repeat(3) { dying.screen("S$it") }
+        sent.clear()
+        dying.flush(force = true)
+        val firstId = batches.single().getString("b")
+        assertTrue(fileAtSend!!.contains(firstId))
+
+        disk.file = fileAtSend
+        sent.clear()
+        answer = 202
+        tracker = newTracker()
+        tracker.configure("MS-APP00001", "com.acme.shop", "https://analytics.api.dev.metricsensei.com")
+        tracker.flush(force = true)
+        assertEquals(firstId, batches.single().getString("b"))
+        assertEquals(3, batches.single().getJSONArray("ev").length())
+    }
+
+    @Test
     fun `a batch keeps its ID across a restart`() {
         answer = null
         tracker.screen("A")
